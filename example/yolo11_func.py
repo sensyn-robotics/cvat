@@ -18,5 +18,3 @@ def detect(context, image):
     conf_threshold = 0.5 if context.conf_threshold is None else context.conf_threshold
     return list(_yolo_to_cvat(_model.predict(
         source=image, verbose=False, conf=conf_threshold)))
-‍
-

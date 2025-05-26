@@ -55,4 +55,5 @@ name = "cvat-related-tools"
 version = "0.1.0"
 dependencies = [
     "cvat-cli>=2.37.0",
+    "ultralytics>=8.3.145",
 ]
