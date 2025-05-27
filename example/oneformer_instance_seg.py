@@ -1,9 +1,10 @@
-import cv2  # OpenCV for contour finding
 import cvat_sdk.auto_annotation as cvataa
 import cvat_sdk.models as models  # For the return type hint (as in your example)
 import numpy as np
 import PIL.Image
 import torch
+from cvat_sdk.masks import mask_to_bbox as cvat_sdk_mask_to_bbox
+from cvat_sdk.masks import mask_to_rle as cvat_sdk_mask_to_rle
 from transformers import (
     AutoConfig,
     OneFormerForUniversalSegmentation,
@@ -79,6 +80,78 @@ spec = cvataa.DetectionFunctionSpec(labels=_labels_for_spec)
 print("INFO: Global 'spec' defined.")
 
 
+def _oneformer_instance_to_cvat_shapes(
+    panoptic_outputs, original_image_size_wh, model_id2label_mapping
+):  # model_id2label_mapping currently unused
+    generated_shapes = []
+    if not panoptic_outputs:
+        return generated_shapes
+
+    output_data = panoptic_outputs[0]
+    segmentation_map_tensor = output_data.get("segmentation")
+    segments_info_list = output_data.get("segments_info")
+
+    if segmentation_map_tensor is None or not segments_info_list:
+        return []
+
+    segmentation_map_np = segmentation_map_tensor.cpu().numpy()
+
+    for segment_info in segments_info_list:
+        segment_id_in_map = segment_info["id"]
+        model_internal_label_id = segment_info["label_id"]
+
+        # instance_mask_np is a (height, width) 2D NumPy array (binary 0 or 1)
+        instance_mask_np = (segmentation_map_np == segment_id_in_map).astype(np.uint8)
+
+        # Use sum of pixels for area threshold
+        if (
+            np.sum(instance_mask_np) < POLYGON_AREA_THRESHOLD
+        ):  # Ensure this threshold makes sense for pixel sum
+            continue
+
+        # --- Use cvat_sdk.masks to get RLE (List[int]) and Bbox ---
+        try:
+            rle_int_list = cvat_sdk_mask_to_rle(instance_mask_np)
+            # mask_to_bbox returns [xtl, ytl, xbr, ybr]
+            bbox_xyxy = cvat_sdk_mask_to_bbox(instance_mask_np)
+            xtl, ytl, xbr, ybr = bbox_xyxy[0], bbox_xyxy[1], bbox_xyxy[2], bbox_xyxy[3]
+        except Exception as e:
+            print(
+                f"WARNING (shapes): Error using cvat_sdk.masks utilities for label {model_internal_label_id}: {e}. Skipping this mask."
+            )
+            continue
+        # --- End of cvat_sdk.masks usage ---
+
+        # Ensure RLE list is not empty (mask_to_rle might return empty for empty mask)
+        if not rle_int_list:
+            print(
+                f"WARNING (shapes): cvat_sdk_mask_to_rle returned empty list for label {model_internal_label_id}. Skipping this mask."
+            )
+            continue
+
+        # Ensure width and height are positive
+        width = xbr - xtl
+        height = ybr - ytl
+        if width <= 0 or height <= 0:
+            print(
+                f"WARNING (shapes): Skipping mask for label {model_internal_label_id} due to non-positive width/height from bbox: w={width}, h={height}"
+            )
+            continue
+
+        generated_shapes.append(
+            cvataa.mask(
+                label_id=int(model_internal_label_id),
+                points=rle_int_list,  # This is now List[int] from cvat_sdk_mask_to_rle
+                left=float(xtl),
+                top=float(ytl),
+                right=float(xbr),  # Use xbr directly
+                bottom=float(ybr),  # Use ybr directly
+            )
+        )
+
+    return generated_shapes
+
+
 # --- 3. `detect()` Function ---
 def detect(
     context: cvataa.DetectionFunctionContext, image: PIL.Image.Image
@@ -108,113 +181,31 @@ def detect(
             f"INFO (detect): Using default confidence threshold: {active_conf_threshold}"
         )
 
-    original_size_hw = image.size[::-1]  # (height, width)
+    # original_size_hw は (height, width) だが、Pillowのimage.sizeは (width, height)
+    original_size_wh = image.size  # (width, height)
     generated_shapes = []
 
     try:
-        # Preprocess image
-        # For OneFormer, "instance" task_inputs is typically used for instance segmentation.
-        # Some model variants might prefer "panoptic" for instance-style outputs.
         inputs = _processor(
             images=image, task_inputs=["instance"], return_tensors="pt"
         ).to(_device)
-
         with torch.no_grad():
             outputs = _model(**inputs)
 
-        # Post-process for instance segmentation
-        # target_sizes expects a list of (height, width) tuples
         instance_seg_outputs = _processor.post_process_instance_segmentation(
-            outputs, target_sizes=[original_size_hw], threshold=active_conf_threshold
+            outputs,
+            target_sizes=[original_size_wh[::-1]],  # (height, width) を渡す
+            threshold=active_conf_threshold,
         )
-        # Expected output: list of [dict_per_image]. Each dict_per_image has:
-        # - "segmentation": 2D torch.Tensor (segment_id map for the image)
-        # - "segments_info": list of dicts (one per detected instance/segment)
-        #   - each segment_info_dict: {"id": segment_id, "label_id": model_class_id, "score": ...}
 
         if not instance_seg_outputs:
             print("INFO (detect): No instance segmentation outputs from processor.")
             return []
 
-        # Assuming batch size of 1 was processed
-        output_data = instance_seg_outputs[0]
-        segmentation_map_tensor = output_data.get("segmentation")
-        segments_info_list = output_data.get("segments_info")
-
-        if segmentation_map_tensor is None or not segments_info_list:
-            print("INFO (detect): Segmentation map or segments_info is missing/empty.")
-            return []
-
-        segmentation_map_np = segmentation_map_tensor.cpu().numpy()
-
-        for segment_info in segments_info_list:
-            # The 'threshold' in post_process_instance_segmentation should have already filtered by score.
-            # segment_info['score'] is available if further filtering is needed.
-
-            segment_id_in_map = segment_info["id"]
-            model_internal_label_id = segment_info[
-                "label_id"
-            ]  # This is the model's own integer class ID
-
-            # Create a binary mask for the current segment/instance
-            instance_mask_np = (segmentation_map_np == segment_id_in_map).astype(
-                np.uint8
-            )
-
-            if (
-                np.sum(instance_mask_np) < POLYGON_AREA_THRESHOLD
-            ):  # Skip if mask is too small or empty
-                continue
-
-            # Convert binary mask to polygon(s) using OpenCV
-            contours, _ = cv2.findContours(
-                instance_mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-
-            for contour in contours:
-                if cv2.contourArea(contour) < POLYGON_AREA_THRESHOLD:
-                    continue
-
-                # Convert contour to a polygon shape
-                # epsilon = POLYGON_SIMPLIFICATION_EPSILON_FACTOR * cv2.arcLength(
-                #     contour, True
-                # )
-                # approx_polygon_points = cv2.approxPolyDP(contour, epsilon, True)
-
-                # # Flatten polygon points for CVAT: [x1, y1, x2, y2, ...]
-                # points_flat_list = approx_polygon_points.reshape(-1).tolist()
-
-                # if (
-                #     len(points_flat_list) >= 6
-                # ):  # A polygon needs at least 3 points (6 values)
-                #     generated_shapes.append(
-                #         cvataa.polygon(
-                #             label_id=int(
-                #                 model_internal_label_id
-                #             ),  # Use model's label ID, should map to spec
-                #             points=points_flat_list,
-                #         )
-                #     )
-
-                # instead of creaing a polygon, calculate the bounding box
-                np_contour_points = np.array(contour).reshape(
-                    -1, 2
-                )  # Ensure contour is Nx2
-                x_min, y_min = np.min(np_contour_points, axis=0)
-                x_max, y_max = np.max(np_contour_points, axis=0)
-
-                # Create a rectangle shape
-                generated_shapes.append(
-                    cvataa.rectangle(  # <--- CHANGE HERE
-                        label_id=int(model_internal_label_id),
-                        points=[
-                            float(x_min),
-                            float(y_min),
-                            float(x_max),
-                            float(y_max),
-                        ],  # Ensure points are floats
-                    )
-                )
+        # _model.config.id2label を渡すが、現在の _oneformer_instance_to_cvat_shapes は未使用
+        generated_shapes = _oneformer_instance_to_cvat_shapes(
+            instance_seg_outputs, original_size_wh, {}
+        )
 
     except Exception as e:
         print(
@@ -222,10 +213,10 @@ def detect(
         )
         import traceback
 
-        print(traceback.format_exc())  # Print full traceback for debugging
-        return []  # Return empty list on error
+        print(traceback.format_exc())
+        return []
 
-    print(f"INFO (detect): Found {len(generated_shapes)} polygon shapes.")
+    print(f"INFO (detect): Found {len(generated_shapes)} RLE mask shapes.")
     return generated_shapes
 
 
