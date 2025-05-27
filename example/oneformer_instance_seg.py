@@ -1,5 +1,6 @@
-import cv2
+import cv2  # OpenCV for contour finding
 import cvat_sdk.auto_annotation as cvataa
+import cvat_sdk.models as models  # For the return type hint (as in your example)
 import numpy as np
 import PIL.Image
 import torch
@@ -10,188 +11,223 @@ from transformers import (
 )
 
 # --- Configuration ---
+# You can choose different OneFormer models from Hugging Face.
+# COCO models are good for general instance segmentation.
 MODEL_NAME = "shi-labs/oneformer_coco_swin_large"
-CONFIDENCE_THRESHOLD = 0.5
+# Other options:
+# MODEL_NAME = "shi-labs/oneformer_cityscapes_swin_large" # For Cityscapes (street scenes)
+# MODEL_NAME = "shi-labs/oneformer_ade20k_swin_large" # For ADE20K (broader semantic/instance)
+
+CONFIDENCE_THRESHOLD = 0.5  # Threshold for keeping detected instances
+POLYGON_AREA_THRESHOLD = 10  # Minimum area (pixels) for a polygon to be kept
+POLYGON_SIMPLIFICATION_EPSILON_FACTOR = 0.002  # Factor for cv2.approxPolyDP
+
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# --- Global Variables for Model ---
+# --- 1. Global Model Loading (can be slow) ---
+print(
+    f"INFO: Attempting to load OneFormer model and processor globally: {MODEL_NAME} on device: {_device}"
+)
+print(
+    "INFO: This may take some time, especially on the first run or with large models..."
+)
 _model = None
 _processor = None
+_model_config = None  # To store config for spec and later use if model loads
 
+try:
+    # Try to load config first for spec, as it's lighter
+    _model_config = AutoConfig.from_pretrained(MODEL_NAME)
+    print(f"INFO: Successfully loaded model configuration for {MODEL_NAME}.")
 
-# --- Helper function to create the spec (remains the same) ---
-def _generate_spec_object():
-    print(f"Attempting to load configuration for {MODEL_NAME} to generate spec...")
-    try:
-        config = AutoConfig.from_pretrained(MODEL_NAME)
-        if not hasattr(config, "id2label"):
-            raise ValueError(
-                f"Model config for {MODEL_NAME} does not have 'id2label' attribute."
-            )
-        current_labels = []
-        for id_str, name_str in config.id2label.items():
-            try:
-                cvat_id = int(id_str)
-                current_labels.append(cvataa.label_spec(name=name_str, id=cvat_id))
-            except ValueError:
-                print(
-                    f"Warning in _generate_spec_object: Could not convert model label ID '{id_str}' to int for label '{name_str}'. Skipping."
-                )
-                pass
-        if not current_labels:
-            print(
-                "Warning in _generate_spec_object: No labels could be generated from model config."
-            )
-        print(
-            f"_generate_spec_object: Generated labels for spec: {[l.name for l in current_labels]}"
-        )
-        return cvataa.DetectionFunctionSpec(labels=current_labels)
-    except Exception as e:
-        print(f"Error in _generate_spec_object(): {e}")
-        raise RuntimeError(
-            f"Failed to generate spec in _generate_spec_object() for model {MODEL_NAME}: {e}"
-        )
-
-
-spec = _generate_spec_object()
-
-
-def get_spec():
-    global spec
-    return spec
-
-
-# --- Initialization (called by CVAT agent when it starts) ---
-def init_context(context):
-    global _model, _processor
-
-    # Use print for initial, critical logging, then try context.logger
+    _processor = OneFormerProcessor.from_pretrained(MODEL_NAME)
+    _model = OneFormerForUniversalSegmentation.from_pretrained(MODEL_NAME).to(_device)
+    _model.eval()  # Set model to evaluation mode
     print(
-        "PROGRESS: init_context called."
-    )  # Print immediately when function is entered
+        "INFO: OneFormer model and processor loaded successfully and set to eval mode."
+    )
+except Exception as e:
+    print(f"ERROR: Failed to load OneFormer model/processor globally: {e}")
+    print("ERROR: Subsequent 'detect' calls will likely fail or return empty results.")
+    # _model and _processor will remain None
 
-    log_info = lambda msg: print(f"INFO (init_context): {msg}")
-    log_error = lambda msg: print(f"ERROR (init_context): {msg}")
+# --- 2. Global `spec` Definition ---
+print("INFO: Defining global 'spec' for CVAT auto annotation...")
+_labels_for_spec = []
+if _model_config and hasattr(_model_config, "id2label"):
+    for id_str, name_str in _model_config.id2label.items():
+        try:
+            # Use the model's own integer class ID for the CVAT spec
+            cvat_id = int(id_str)
+            _labels_for_spec.append(cvataa.label_spec(name=name_str, id=cvat_id))
+        except ValueError:
+            print(
+                f"WARNING (spec): Could not convert model label ID '{id_str}' to int for label '{name_str}'. Skipping."
+            )
+    print(
+        f"INFO (spec): Generated labels for spec: {[l.name for l in _labels_for_spec]}"
+    )
+else:
+    print(
+        "WARNING (spec): Model config or id2label not available. Spec will have no labels."
+    )
+    print(
+        "WARNING (spec): This might cause issues with 'cvat-cli create-native' or UI."
+    )
 
-    if hasattr(context, "logger") and context.logger is not None:
-        log_info = context.logger.info
-        log_error = context.logger.error
+spec = cvataa.DetectionFunctionSpec(labels=_labels_for_spec)
+print("INFO: Global 'spec' defined.")
+
+
+# --- 3. `detect()` Function ---
+def detect(
+    context: cvataa.DetectionFunctionContext, image: PIL.Image.Image
+) -> list[models.LabeledShapeRequest]:
+    if not _model or not _processor:
+        print(
+            "ERROR (detect): OneFormer model or processor was not loaded globally. Cannot perform detection."
+        )
+        return []
+
+    # Get confidence threshold from context if available, otherwise use default
+    active_conf_threshold = CONFIDENCE_THRESHOLD
+    if hasattr(context, "conf_threshold") and context.conf_threshold is not None:
+        # Ensure context.conf_threshold is valid (e.g. float)
+        try:
+            active_conf_threshold = float(context.conf_threshold)
+            print(
+                f"INFO (detect): Using confidence threshold from context: {active_conf_threshold}"
+            )
+        except (ValueError, TypeError):
+            print(
+                f"WARNING (detect): Invalid conf_threshold in context ('{context.conf_threshold}'). Using default: {CONFIDENCE_THRESHOLD}"
+            )
+            active_conf_threshold = CONFIDENCE_THRESHOLD
     else:
-        print("WARNING (init_context): context.logger not available, using print.")
+        print(
+            f"INFO (detect): Using default confidence threshold: {active_conf_threshold}"
+        )
 
-    log_info(f"Initializing OneFormer model: {MODEL_NAME} on device: {_device}")
+    original_size_hw = image.size[::-1]  # (height, width)
+    generated_shapes = []
 
     try:
-        log_info("Loading processor...")
-        _processor = OneFormerProcessor.from_pretrained(MODEL_NAME)
-        log_info("Processor loaded.")
-
-        log_info("Loading model...")
-        _model = OneFormerForUniversalSegmentation.from_pretrained(MODEL_NAME).to(
-            _device
-        )
-        _model.eval()  # Set model to evaluation mode
-        log_info("Model loaded and set to eval mode.")
-
-        log_info("OneFormer model initialized SUCCESSFULLY.")
-
-    except Exception as e:
-        log_error(f"Error during OneFormer model initialization: {e}")
-        # Re-raise the exception to ensure the agent knows init failed critically
-        raise RuntimeError(f"Failed to initialize model in init_context: {e}")
-
-
-# --- Output Conversion (remains the same) ---
-def _oneformer_instance_to_cvat_shapes(
-    panoptic_outputs, original_image_size, model_id2label_mapping
-):
-    # ... (same as previous version)
-    shapes = []
-    if not panoptic_outputs:
-        return shapes
-    if (
-        not panoptic_outputs[0].get("segments_info")
-        or panoptic_outputs[0].get("segmentation") is None
-    ):
-        return shapes
-    segmentation_map = panoptic_outputs[0]["segmentation"]
-    segments_info = panoptic_outputs[0]["segments_info"]
-    segmentation_map_np = segmentation_map.cpu().numpy()
-    for segment in segments_info:
-        if segment["score"] < CONFIDENCE_THRESHOLD:
-            continue
-        segment_id = segment["id"]
-        model_label_id = segment["label_id"]
-        instance_mask = (segmentation_map_np == segment_id).astype(np.uint8)
-        if np.sum(instance_mask) == 0:
-            continue
-        contours, _ = cv2.findContours(
-            instance_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
-        for contour in contours:
-            if cv2.contourArea(contour) < 5:
-                continue
-            epsilon = 0.005 * cv2.arcLength(contour, True)
-            approx_polygon = cv2.approxPolyDP(contour, epsilon, True)
-            points = approx_polygon.reshape(-1).tolist()
-            if len(points) >= 6:
-                shapes.append(
-                    cvataa.polygon(label_id=int(model_label_id), points=points)
-                )
-    return shapes
-
-
-# --- Main Detection Function ---
-def detect(context, image: PIL.Image.Image):
-    global _model, _processor
-
-    # Basic logging, try context.logger if available
-    log_info_detect = lambda msg: print(f"INFO (detect): {msg}")
-    log_error_detect = lambda msg: print(f"ERROR (detect): {msg}")
-    if hasattr(context, "logger") and context.logger is not None:
-        log_info_detect = context.logger.info
-        log_error_detect = context.logger.error
-    else:
-        print("WARNING (detect): context.logger not available, using print.")
-
-    log_info_detect("Function called.")
-
-    if _model is None or _processor is None:
-        log_error_detect(
-            "Model or processor not initialized. Ensure init_context was called and completed successfully."
-        )
-        return []  # Return empty list on error as per CVAT spec
-
-    original_size_hw = image.size[::-1]
-
-    try:
-        log_info_detect("Preprocessing image with OneFormer processor...")
+        # Preprocess image
+        # For OneFormer, "instance" task_inputs is typically used for instance segmentation.
+        # Some model variants might prefer "panoptic" for instance-style outputs.
         inputs = _processor(
             images=image, task_inputs=["instance"], return_tensors="pt"
         ).to(_device)
-        log_info_detect("Image preprocessed. Performing inference...")
 
         with torch.no_grad():
             outputs = _model(**inputs)
-        log_info_detect("Inference complete. Post-processing...")
 
+        # Post-process for instance segmentation
+        # target_sizes expects a list of (height, width) tuples
         instance_seg_outputs = _processor.post_process_instance_segmentation(
-            outputs, target_sizes=[original_size_hw], threshold=CONFIDENCE_THRESHOLD
+            outputs, target_sizes=[original_size_hw], threshold=active_conf_threshold
         )
-        log_info_detect("Post-processing complete.")
+        # Expected output: list of [dict_per_image]. Each dict_per_image has:
+        # - "segmentation": 2D torch.Tensor (segment_id map for the image)
+        # - "segments_info": list of dicts (one per detected instance/segment)
+        #   - each segment_info_dict: {"id": segment_id, "label_id": model_class_id, "score": ...}
+
+        if not instance_seg_outputs:
+            print("INFO (detect): No instance segmentation outputs from processor.")
+            return []
+
+        # Assuming batch size of 1 was processed
+        output_data = instance_seg_outputs[0]
+        segmentation_map_tensor = output_data.get("segmentation")
+        segments_info_list = output_data.get("segments_info")
+
+        if segmentation_map_tensor is None or not segments_info_list:
+            print("INFO (detect): Segmentation map or segments_info is missing/empty.")
+            return []
+
+        segmentation_map_np = segmentation_map_tensor.cpu().numpy()
+
+        for segment_info in segments_info_list:
+            # The 'threshold' in post_process_instance_segmentation should have already filtered by score.
+            # segment_info['score'] is available if further filtering is needed.
+
+            segment_id_in_map = segment_info["id"]
+            model_internal_label_id = segment_info[
+                "label_id"
+            ]  # This is the model's own integer class ID
+
+            # Create a binary mask for the current segment/instance
+            instance_mask_np = (segmentation_map_np == segment_id_in_map).astype(
+                np.uint8
+            )
+
+            if (
+                np.sum(instance_mask_np) < POLYGON_AREA_THRESHOLD
+            ):  # Skip if mask is too small or empty
+                continue
+
+            # Convert binary mask to polygon(s) using OpenCV
+            contours, _ = cv2.findContours(
+                instance_mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            for contour in contours:
+                if cv2.contourArea(contour) < POLYGON_AREA_THRESHOLD:
+                    continue
+
+                # Convert contour to a polygon shape
+                # epsilon = POLYGON_SIMPLIFICATION_EPSILON_FACTOR * cv2.arcLength(
+                #     contour, True
+                # )
+                # approx_polygon_points = cv2.approxPolyDP(contour, epsilon, True)
+
+                # # Flatten polygon points for CVAT: [x1, y1, x2, y2, ...]
+                # points_flat_list = approx_polygon_points.reshape(-1).tolist()
+
+                # if (
+                #     len(points_flat_list) >= 6
+                # ):  # A polygon needs at least 3 points (6 values)
+                #     generated_shapes.append(
+                #         cvataa.polygon(
+                #             label_id=int(
+                #                 model_internal_label_id
+                #             ),  # Use model's label ID, should map to spec
+                #             points=points_flat_list,
+                #         )
+                #     )
+
+                # instead of creaing a polygon, calculate the bounding box
+                np_contour_points = np.array(contour).reshape(
+                    -1, 2
+                )  # Ensure contour is Nx2
+                x_min, y_min = np.min(np_contour_points, axis=0)
+                x_max, y_max = np.max(np_contour_points, axis=0)
+
+                # Create a rectangle shape
+                generated_shapes.append(
+                    cvataa.rectangle(  # <--- CHANGE HERE
+                        label_id=int(model_internal_label_id),
+                        points=[
+                            float(x_min),
+                            float(y_min),
+                            float(x_max),
+                            float(y_max),
+                        ],  # Ensure points are floats
+                    )
+                )
 
     except Exception as e:
-        log_error_detect(f"Error during OneFormer inference or post-processing: {e}")
-        return []
-
-    try:
-        log_info_detect("Converting OneFormer output to CVAT shapes...")
-        cvat_shapes = _oneformer_instance_to_cvat_shapes(
-            instance_seg_outputs, original_size_hw, _model.config.id2label
+        print(
+            f"ERROR (detect): Exception during OneFormer inference or processing: {e}"
         )
-        log_info_detect(f"Conversion complete. Found {len(cvat_shapes)} shapes.")
-    except Exception as e:
-        log_error_detect(f"Error during shape conversion: {e}")
-        return []
+        import traceback
 
-    return cvat_shapes
+        print(traceback.format_exc())  # Print full traceback for debugging
+        return []  # Return empty list on error
+
+    print(f"INFO (detect): Found {len(generated_shapes)} polygon shapes.")
+    return generated_shapes
+
+
+# No init_context() or get_spec() as per the user's working example structure.
+print("INFO: OneFormer segmentation script definition complete. Ready for CVAT agent.")
