@@ -3,8 +3,7 @@ import cvat_sdk.models as models  # For the return type hint (as in your example
 import numpy as np
 import PIL.Image
 import torch
-from cvat_sdk.masks import mask_to_bbox as cvat_sdk_mask_to_bbox
-from cvat_sdk.masks import mask_to_rle as cvat_sdk_mask_to_rle
+from cvat_sdk.masks import encode_mask as cvat_sdk_encode_mask
 from transformers import (
     AutoConfig,
     OneFormerForUniversalSegmentation,
@@ -20,8 +19,7 @@ MODEL_NAME = "shi-labs/oneformer_coco_swin_large"
 # MODEL_NAME = "shi-labs/oneformer_ade20k_swin_large" # For ADE20K (broader semantic/instance)
 
 CONFIDENCE_THRESHOLD = 0.5  # Threshold for keeping detected instances
-POLYGON_AREA_THRESHOLD = 10  # Minimum area (pixels) for a polygon to be kept
-POLYGON_SIMPLIFICATION_EPSILON_FACTOR = 0.002  # Factor for cv2.approxPolyDP
+MIN_MASK_AREA_PIXELS = 10  # Minimum number of pixels in a mask to be considered
 
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -82,7 +80,7 @@ print("INFO: Global 'spec' defined.")
 
 def _oneformer_instance_to_cvat_shapes(
     panoptic_outputs, original_image_size_wh, model_id2label_mapping
-):  # model_id2label_mapping currently unused
+):
     generated_shapes = []
     if not panoptic_outputs:
         return generated_shapes
@@ -94,58 +92,74 @@ def _oneformer_instance_to_cvat_shapes(
     if segmentation_map_tensor is None or not segments_info_list:
         return []
 
-    segmentation_map_np = segmentation_map_tensor.cpu().numpy()
+    segmentation_map_np = segmentation_map_tensor.cpu().numpy()  # This is (H, W)
 
     for segment_info in segments_info_list:
         segment_id_in_map = segment_info["id"]
         model_internal_label_id = segment_info["label_id"]
 
-        # instance_mask_np is a (height, width) 2D NumPy array (binary 0 or 1)
-        instance_mask_np = (segmentation_map_np == segment_id_in_map).astype(np.uint8)
+        # instance_mask_np is a (height, width) 2D NumPy array (0 or 1)
+        instance_mask_np_uint8 = (segmentation_map_np == segment_id_in_map).astype(
+            np.uint8
+        )
 
-        # Use sum of pixels for area threshold
-        if (
-            np.sum(instance_mask_np) < POLYGON_AREA_THRESHOLD
-        ):  # Ensure this threshold makes sense for pixel sum
+        if np.sum(instance_mask_np_uint8) < MIN_MASK_AREA_PIXELS:
             continue
 
-        # --- Use cvat_sdk.masks to get RLE (List[int]) and Bbox ---
-        try:
-            rle_int_list = cvat_sdk_mask_to_rle(instance_mask_np)
-            # mask_to_bbox returns [xtl, ytl, xbr, ybr]
-            bbox_xyxy = cvat_sdk_mask_to_bbox(instance_mask_np)
-            xtl, ytl, xbr, ybr = bbox_xyxy[0], bbox_xyxy[1], bbox_xyxy[2], bbox_xyxy[3]
-        except Exception as e:
-            print(
-                f"WARNING (shapes): Error using cvat_sdk.masks utilities for label {model_internal_label_id}: {e}. Skipping this mask."
-            )
-            continue
-        # --- End of cvat_sdk.masks usage ---
-
-        # Ensure RLE list is not empty (mask_to_rle might return empty for empty mask)
-        if not rle_int_list:
-            print(
-                f"WARNING (shapes): cvat_sdk_mask_to_rle returned empty list for label {model_internal_label_id}. Skipping this mask."
-            )
+        # Calculate tight bounding box [xtl, ytl, xbr, ybr] for the current instance mask
+        rows, cols = np.where(instance_mask_np_uint8)
+        if rows.size == 0 or cols.size == 0:  # Empty mask after all
             continue
 
-        # Ensure width and height are positive
+        xtl = float(np.min(cols))
+        ytl = float(np.min(rows))
+        xbr = float(np.max(cols) + 1.0)  # Make it exclusive for bottom-right
+        ybr = float(np.max(rows) + 1.0)  # Make it exclusive for bottom-right
+
         width = xbr - xtl
         height = ybr - ytl
         if width <= 0 or height <= 0:
+            continue
+
+        # Ensure the bitmap is boolean for cvat_sdk_encode_mask
+        boolean_bitmap = instance_mask_np_uint8.astype(bool)
+
+        # The bbox for encode_mask is [x1, y1, x2, y2] (inclusive for x1,y1; exclusive for x2,y2 often)
+        # The doc says "limited to points between (x1,y1) and (x2,y2)" and "(0,0) <= (x1,y1) < (x2,y2) <= (W,H)"
+        # This implies x2,y2 are exclusive limits.
+        # Our xbr, ybr are already exclusive.
+        bbox_for_encode_mask = [xtl, ytl, xbr, ybr]
+
+        try:
+            # Use cvat_sdk.masks.encode_mask
+            # bitmap should be the full image sized boolean mask for the instance
+            # bbox defines the area to consider within that bitmap.
+            rle_float_list = cvat_sdk_encode_mask(
+                boolean_bitmap, bbox=bbox_for_encode_mask
+            )
+        except Exception as e:
             print(
-                f"WARNING (shapes): Skipping mask for label {model_internal_label_id} due to non-positive width/height from bbox: w={width}, h={height}"
+                f"ERROR (shapes): cvat_sdk_encode_mask failed for label {model_internal_label_id}: {e}"
+            )
+            import traceback
+
+            print(traceback.format_exc())
+            continue
+
+        if not rle_float_list:  # If encode_mask returns empty list for some reason
+            print(
+                f"WARNING (shapes): cvat_sdk_encode_mask returned empty RLE list for label {model_internal_label_id}. Skipping."
             )
             continue
 
         generated_shapes.append(
             cvataa.mask(
                 label_id=int(model_internal_label_id),
-                points=rle_int_list,  # This is now List[int] from cvat_sdk_mask_to_rle
-                left=float(xtl),
-                top=float(ytl),
-                right=float(xbr),  # Use xbr directly
-                bottom=float(ybr),  # Use ybr directly
+                points=rle_float_list,  # This is now List[float] from cvat_sdk_encode_mask
+                left=xtl,
+                top=ytl,
+                right=xbr,  # Use xbr directly (exclusive)
+                bottom=ybr,  # Use ybr directly (exclusive)
             )
         )
 
