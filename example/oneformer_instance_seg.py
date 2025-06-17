@@ -17,10 +17,8 @@ MODEL_NAME = "shi-labs/oneformer_coco_swin_large"
 # Other options:
 # MODEL_NAME = "shi-labs/oneformer_cityscapes_swin_large" # For Cityscapes (street scenes)
 # MODEL_NAME = "shi-labs/oneformer_ade20k_swin_large" # For ADE20K (broader semantic/instance)
-
 CONFIDENCE_THRESHOLD = 0.5  # Threshold for keeping detected instances
 MIN_MASK_AREA_PIXELS = 10  # Minimum number of pixels in a mask to be considered
-
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # --- 1. Global Model Loading (can be slow) ---
@@ -58,7 +56,9 @@ if _model_config and hasattr(_model_config, "id2label"):
         try:
             # Use the model's own integer class ID for the CVAT spec
             cvat_id = int(id_str)
-            _labels_for_spec.append(cvataa.label_spec(name=name_str, id=cvat_id))
+            _labels_for_spec.append(
+                cvataa.label_spec(name=name_str, id=cvat_id, type="mask")
+            )
         except ValueError:
             print(
                 f"WARNING (spec): Could not convert model label ID '{id_str}' to int for label '{name_str}'. Skipping."
