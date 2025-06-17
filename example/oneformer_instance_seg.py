@@ -236,3 +236,173 @@ def detect(
 
 # No init_context() or get_spec() as per the user's working example structure.
 print("INFO: OneFormer segmentation script definition complete. Ready for CVAT agent.")
+
+
+# --- Local Testing Section ---
+if __name__ == "__main__":
+    import argparse  # Import argparse
+    import os
+    from types import SimpleNamespace  # For a simple mock context
+
+    import cv2  # For visualization (ensure opencv-python is installed)
+
+    print("\n--- RUNNING LOCAL TEST ---")
+
+    # --- 1. Setup Argument Parser ---
+    parser = argparse.ArgumentParser(
+        description="Local test runner for OneFormer instance segmentation script."
+    )
+    parser.add_argument(
+        "--image-path",
+        type=str,
+        required=True,
+        help="Path to the test image file (e.g., /home/mas/test_images/my_image.png)",
+    )
+    parser.add_argument(
+        "--conf-threshold",
+        type=float,
+        default=0.3,  # Default confidence threshold if not provided
+        help="Confidence threshold for detection (default: 0.3)",
+    )
+    args = parser.parse_args()
+
+    # --- 2. Configuration for Local Test (from arguments) ---
+    TEST_IMAGE_PATH = args.image_path
+    LOCAL_TEST_CONF_THRESHOLD = args.conf_threshold
+
+    print(f"INFO (Local Test): Test image path from argument: {TEST_IMAGE_PATH}")
+    print(
+        f"INFO (Local Test): Confidence threshold from argument: {LOCAL_TEST_CONF_THRESHOLD}"
+    )
+
+    if not os.path.exists(TEST_IMAGE_PATH):
+        print(
+            f"ERROR (Local Test): Test image not found at '{TEST_IMAGE_PATH}'. Please set the correct path."
+        )
+        exit()
+
+    # --- 3. Ensure Global Model is Loaded (it should be if script is run directly) ---
+    if not _model or not _processor:
+        print("ERROR (Local Test): Model or processor not loaded. Exiting local test.")
+        print(
+            "Ensure the script is run in an environment where the model can be downloaded or found."
+        )
+        exit()
+    # ... (rest of your local testing code from "print(f"INFO (Local Test): Using globally loaded model: {MODEL_NAME}")" onwards remains the same) ...
+    # ... existing code ...
+    print(f"INFO (Local Test): Using globally loaded model: {MODEL_NAME}")
+
+    # --- 4. Create a Mock CVAT Context ---
+    # The context object in CVAT provides attributes like 'task_id', 'job_id', 'conf_threshold', etc.
+    # For local testing, we mainly need 'conf_threshold'.
+    mock_context = SimpleNamespace(
+        conf_threshold=LOCAL_TEST_CONF_THRESHOLD,
+        # Add other attributes if your 'detect' function or its callees expect them
+        # e.g., user_data={}, function_options={}
+    )
+    print(
+        f"INFO (Local Test): Mock context created with conf_threshold = {mock_context.conf_threshold}"
+    )
+
+    # --- 5. Load the Test Image ---
+    try:
+        pil_image = PIL.Image.open(TEST_IMAGE_PATH).convert("RGB")
+        print(
+            f"INFO (Local Test): Successfully loaded test image: {TEST_IMAGE_PATH} (Size: {pil_image.size})"
+        )
+    except Exception as e:
+        print(f"ERROR (Local Test): Failed to load test image '{TEST_IMAGE_PATH}': {e}")
+        exit()
+
+    # --- 6. Call the detect Function ---
+    print("INFO (Local Test): Calling detect function...")
+
+    detected_shapes = detect(mock_context, pil_image)
+    print(f"INFO (Local Test): detect function returned {len(detected_shapes)} shapes.")
+
+    # --- 7. Inspect and Visualize Results ---
+    if not detected_shapes:
+        print("INFO (Local Test): No shapes were detected.")
+    else:
+        print("\n--- Detected Shapes (Summary) ---")
+        for i, shape in enumerate(detected_shapes):
+            label_name = "Unknown"
+            if (
+                _model_config
+                and hasattr(_model_config, "id2label")
+                and shape.label_id in _model_config.id2label
+            ):
+                label_name = _model_config.id2label[shape.label_id]
+
+            print(
+                f"Shape {i + 1}: Label ID={shape.label_id} (Name: {label_name}), "
+                f"Type={shape.type}, Points Length={len(shape.points)}, "
+                f"BBox=[{shape.left:.1f}, {shape.top:.1f}, {shape.right:.1f}, {shape.bottom:.1f}]"
+            )
+            # You can print more details like shape.points if needed for RLE debugging
+
+        # --- Optional: Visualize on Image using OpenCV ---
+        try:
+            # Convert PIL image to OpenCV format
+            cv_image = np.array(pil_image)
+            cv_image = cv2.cvtColor(cv_image, cv2.COLOR_RGB2BGR)
+
+            # Create a mapping from label_id to a color
+            label_colors = {}
+            if _model_config and hasattr(_model_config, "id2label"):
+                for label_id_str in _model_config.id2label.keys():
+                    label_id = int(label_id_str)
+                    # Generate a unique color for each label
+                    label_colors[label_id] = (
+                        (label_id * 50) % 255,
+                        (label_id * 90) % 255,
+                        (label_id * 120) % 255,
+                    )
+
+            output_image_path = "local_test_output.png"
+
+            for shape in detected_shapes:
+                color = label_colors.get(shape.label_id, (0, 0, 255))  # Default to red
+                label_name = (
+                    _model_config.id2label.get(shape.label_id, f"ID:{shape.label_id}")
+                    if _model_config and _model_config.id2label
+                    else f"ID:{shape.label_id}"
+                )
+
+                # For RLE masks, you'd need to decode them to draw.
+                # The cvat_sdk.masks.rle_to_mask can be used.
+                # For simplicity here, we'll just draw the bounding box.
+                xtl, ytl, xbr, ybr = (
+                    int(shape.left),
+                    int(shape.top),
+                    int(shape.right),
+                    int(shape.bottom),
+                )
+                cv2.rectangle(cv_image, (xtl, ytl), (xbr, ybr), color, 2)
+                cv2.putText(
+                    cv_image,
+                    label_name,
+                    (xtl, ytl - 10 if ytl > 20 else ytl + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    color,
+                    2,
+                )
+
+            cv2.imwrite(output_image_path, cv_image)
+            print(f"\nINFO (Local Test): Visualization saved to {output_image_path}")
+            print(
+                "INFO (Local Test): You can open this image to see the detected bounding boxes."
+            )
+            # If you have a display environment:
+            # cv2.imshow("Local Test Detections", cv_image)
+            # cv2.waitKey(0)
+            # cv2.destroyAllWindows()
+
+        except Exception as e:
+            print(f"ERROR (Local Test): Failed during visualization: {e}")
+            import traceback
+
+            print(traceback.format_exc())
+
+    print("\n--- LOCAL TEST COMPLETE ---")
