@@ -1955,7 +1955,7 @@ class CvatToDmAnnotationConverter:
                 if a_desc['input_type'] == AttributeType.NUMBER:
                     a_value = float(a_value)
                 elif a_desc['input_type'] == AttributeType.CHECKBOX:
-                    a_value = (a_value.lower() == 'true')
+                    a_value = a_value.lower() == 'true'
                 dm_attr[a_name] = a_value
             except Exception as e:
                 raise Exception(
@@ -2488,7 +2488,7 @@ def load_dataset_data(project_annotation, dataset: dm.Dataset, project_data):
 
                 if isinstance(dataset_item.media.extra_images, list):
                     dataset_files['media'] += \
-                        list(map(lambda ri: ri.path, dataset_item.media.extra_images))
+                        [ri.path for ri in dataset_item.media.extra_images]
 
         if len(root_paths):
             dataset_files['data_root'] = osp.commonpath(root_paths) + osp.sep

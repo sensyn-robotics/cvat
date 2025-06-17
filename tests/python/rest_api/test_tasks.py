@@ -1721,7 +1721,7 @@ class TestPostTaskData:
 
             # check sequence of frames
             (data_meta, _) = api_client.tasks_api.retrieve_data_meta(task_id)
-            assert expected_result == list(map(lambda x: x.name, data_meta.frames))
+            assert expected_result == [x.name for x in data_meta.frames]
 
     @pytest.mark.with_external_services
     @pytest.mark.parametrize(
@@ -2131,15 +2131,15 @@ class TestPostTaskData:
 
     @parametrize(
         "frame_selection_method, method_params, per_job_count_param",
-        map(
-            lambda e: (*e[0], e[1]),
-            product(
+        (
+            (*e[0], e[1])
+            for e in product(
                 [
                     *tuple(product(["random_uniform"], [{"frame_count"}, {"frame_share"}])),
                     ("manual", {}),
                 ],
                 ["frames_per_job_count", "frames_per_job_share"],
-            ),
+            )
         ),
     )
     def test_can_create_task_with_honeypots(
@@ -4111,15 +4111,13 @@ class TestTaskBackups:
         task_id = next(t for t in tasks if t["validation_mode"] == "gt_pool")["id"]
         self._test_can_export_backup(task_id)
 
-    @pytest.mark.xfail(reason="Should be fixed in 9230 PR")
     def test_cannot_export_backup_for_task_without_data(self, tasks):
         task_id = next(t for t in tasks if t["jobs"]["count"] == 0)["id"]
 
-        # FUTURE-FIXME: broken by 9075, is going to be fixed in https://github.com/cvat-ai/cvat/pull/9230
-        with pytest.raises(BackgroundRequestException) as exc:
+        with pytest.raises(exceptions.ApiException) as capture:
             self._test_can_export_backup(task_id)
 
-        assert "Backup of a task without data is not allowed" == str(exc.value)
+        assert "Backup of a task without data is not allowed" in str(capture.value.body)
 
     @pytest.mark.with_external_services
     def test_can_export_and_import_backup_task_with_cloud_storage(self, tasks):
