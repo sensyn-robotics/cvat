@@ -70,3 +70,5 @@ cvat-ui/dist
 
 # model weights
 *.pt
+*.ckpt
+*.orig

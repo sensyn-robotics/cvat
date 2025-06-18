@@ -101,6 +101,12 @@ class OneFormerPLModule(pl.LightningModule):
         self, model_config_hf, **kwargs
     ):  # Arguments must match how it was trained/saved or passed to load_from_checkpoint
         super().__init__()
+        print(
+            f"DEBUG (OneFormerPLModule.__init__): Received model_config_hf.num_labels = {getattr(model_config_hf, 'num_labels', 'Not Set')}"
+        )
+        print(
+            f"DEBUG (OneFormerPLModule.__init__): Received model_config_hf.id2label = {getattr(model_config_hf, 'id2label', 'Not Set')}"
+        )
         # If you used self.save_hyperparameters() in your training module,
         # PL will try to load them. Explicitly passed args to load_from_checkpoint
         # (like model_config_hf here) will override saved hparams if names clash.
@@ -167,54 +173,85 @@ try:
     # Load config and processor from the base Hugging Face model ID in both cases
     # The config provides id2label, and the processor handles image preprocessing.
     _model_config = AutoConfig.from_pretrained(BASE_HF_MODEL_ID_FOR_CONFIG_PROCESSOR)
-    print("INFO: Successfully loaded model configuration for spec/processor base.")
+    print(
+        f"INFO: Successfully loaded model configuration for spec/processor base. Initial num_labels: {getattr(_model_config, 'num_labels', 'Not Set')}"
+    )
 
     # USER ACTION: If loading from a checkpoint trained with a different number of classes
     # than the BASE_HF_MODEL_ID_FOR_CONFIG_PROCESSOR, adjust num_labels here.
-    # We will use the class information from the YAML file if available.
     if LOAD_FROM_CHECKPOINT:
-        if (
-            _yaml_num_classes is not None
-        ):  # Check if class info was successfully loaded from YAML
-            num_classes_for_checkpoint = _yaml_num_classes
-            id2label_for_checkpoint = _yaml_id2label
-            label2id_for_checkpoint = _yaml_label2id
+        num_labels_for_model_init = (
+            _model_config.num_labels
+        )  # Default to base config's num_labels
+        id2label_for_spec = _model_config.id2label  # Default to base config's id2label
+        label2id_for_spec = _model_config.label2id  # Default to base config's label2id
 
-            if (
-                hasattr(_model_config, "num_labels")
-                and _model_config.num_labels != num_classes_for_checkpoint
-            ):
-                print(
-                    f"INFO: Overriding _model_config.num_labels from {_model_config.num_labels} to {num_classes_for_checkpoint} (from YAML)."
-                )
-                _model_config.num_labels = num_classes_for_checkpoint
-
-            # Also update id2label and label2id in the config to match the YAML classes
-            # This is important for the model's classification head and for the spec generation.
-            if id2label_for_checkpoint:
-                _model_config.id2label = id2label_for_checkpoint
-                print(
-                    f"INFO: Updated _model_config.id2label with {len(id2label_for_checkpoint)} labels from YAML."
-                )
-            if label2id_for_checkpoint:
-                _model_config.label2id = label2id_for_checkpoint
-                print("INFO: Updated _model_config.label2id from YAML.")
-
+        if _yaml_num_classes is not None:  # If YAML provides class info
+            print(
+                f"INFO: YAML provides {_yaml_num_classes} classes: {_yaml_class_names}"
+            )
+            # Use YAML class names for the CVAT spec
+            id2label_for_spec = _yaml_id2label
+            label2id_for_spec = _yaml_label2id
+            num_labels_for_model_init = (
+                _yaml_num_classes  # Tentatively set num_labels for model from YAML
+            )
         else:
-            # Fallback if YAML class info wasn't available - this part might need manual adjustment
-            # or will rely on the previous hardcoded logic if you re-add it.
             print(
-                "WARNING: Class information not available from YAML. Model config might not match checkpoint if num_labels differs from the base model."
+                "WARNING: Class information not available from YAML. Will rely on checkpoint structure or base model config."
             )
-            print(
-                "WARNING: You might need to manually set num_labels, id2label, and label2id if errors occur."
-            )
-            # Example of previous logic (you might need to re-enable/adjust if YAML fails):
-            # num_classes_in_checkpoint = 6 # Default or previously determined number
-            # if hasattr(_model_config, "num_labels") and _model_config.num_labels != num_classes_in_checkpoint:
-            #     print(f"INFO: Overriding _model_config.num_labels from {_model_config.num_labels} to {num_classes_in_checkpoint} (fallback).")
-            #     _model_config.num_labels = num_classes_in_checkpoint
 
+        # CRITICAL: Adjust num_labels for the specific checkpoint if its structure is known
+        # The error indicates tree_logging_v6.ckpt has 6 output units, implying 5 semantic classes.
+        if CHECKPOINT_PATH == "example/tree_logging_v6.ckpt":
+            expected_semantic_classes_for_ckpt = 5
+            print(
+                f"INFO: Checkpoint '{CHECKPOINT_PATH}' is known to require {expected_semantic_classes_for_ckpt} semantic classes for its architecture."
+            )
+            if num_labels_for_model_init != expected_semantic_classes_for_ckpt:
+                print(
+                    f"INFO: Adjusting num_labels for model initialization from {num_labels_for_model_init} to {expected_semantic_classes_for_ckpt} to match checkpoint '{CHECKPOINT_PATH}'."
+                )
+            num_labels_for_model_init = expected_semantic_classes_for_ckpt
+
+        # Apply the determined num_labels to _model_config for model instantiation
+        if (
+            hasattr(_model_config, "num_labels")
+            and _model_config.num_labels != num_labels_for_model_init
+        ):
+            print(
+                f"INFO: Final override: _model_config.num_labels set from {_model_config.num_labels} to {num_labels_for_model_init}."
+            )
+            _model_config.num_labels = num_labels_for_model_init
+        elif (
+            not hasattr(_model_config, "num_labels")
+            and num_labels_for_model_init is not None
+        ):
+            print(
+                f"INFO: Final set: _model_config.num_labels set to {num_labels_for_model_init}."
+            )
+            _model_config.num_labels = num_labels_for_model_init
+
+        # Update _model_config.id2label and label2id using the names from YAML (for CVAT spec)
+        # This happens AFTER num_labels for model architecture is set.
+        # The spec will use these YAML-derived names.
+        if id2label_for_spec:
+            _model_config.id2label = id2label_for_spec
+            print(
+                f"INFO: Updated _model_config.id2label for CVAT spec with {len(id2label_for_spec)} labels from YAML: {_model_config.id2label}"
+            )
+        if label2id_for_spec:
+            _model_config.label2id = label2id_for_spec
+            print(
+                f"INFO: Updated _model_config.label2id for CVAT spec from YAML: {_model_config.label2id}"
+            )
+
+    print(
+        f"DEBUG: _model_config.num_labels before calling load_from_checkpoint: {getattr(_model_config, 'num_labels', 'Not Set')}"
+    )
+    print(
+        f"DEBUG: _model_config.id2label before calling load_from_checkpoint: {getattr(_model_config, 'id2label', 'Not Set')}"
+    )
     _processor = OneFormerProcessor.from_pretrained(
         BASE_HF_MODEL_ID_FOR_CONFIG_PROCESSOR
     )
